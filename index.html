@@ -386,6 +386,10 @@ body::after{
     linear-gradient(180deg, rgba(255,255,255,.04), rgba(0,0,0,.18));
   border:1px solid rgba(255,255,255,.08);
 }
+.deckLook.collapsed{
+  max-height:118px !important;
+  overflow-y:hidden !important;
+}
 .deckLook::before{
   content:"";
   position:absolute;
@@ -977,7 +981,6 @@ select,input[type=text]{
     max-height:520px;
   }
 }
-
 </style>
 </head>
 <body>
@@ -1103,7 +1106,7 @@ select,input[type=text]{
                 </div>
                 <div class="collapsibleBody">
                   <div class="smallGrid">
-                    <button class="miniBtn" id="micEnableBtn">Mic Off</button>
+                    <button class="miniBtn" id="micEnableBtn">Enable Mic</button>
                     <button class="miniBtn on" id="sampleCountdownBtn">Countdown On</button>
                     <button class="miniBtn" id="sampleRecordBtn">Record Sample</button>
                     <button class="miniBtn" id="sampleStopBtn">Stop Sample</button>
@@ -1315,10 +1318,9 @@ function initAudio(){
   const masterDelayFeedback = ctx.createGain();
   const masterDelayGain = ctx.createGain();
   const convolver = ctx.createConvolver();
+
   const reverbGain = ctx.createGain();
 
-  // Shared pad FX buses. These prevent new delay/reverb networks from being
-  // created on every loop hit, which was the main source of lag.
   const padDelay = ctx.createDelay(1.1);
   const padDelayFeedback = ctx.createGain();
   const padDelayGain = ctx.createGain();
@@ -1711,12 +1713,7 @@ function pruneScheduledKeys(currentCycle){
 
 function scheduleEventForAudio(ev, playAt, token){
   if(token !== state.playbackToken || !state.isPlaying) return;
-
-  // Schedule sound directly on the Web Audio clock. This avoids the late
-  // setTimeout cycle glitch that caused loops to repeat randomly after stop.
   playPadSound(ev.sound, ev.settings, ev.pad, playAt);
-
-  // Visual feedback is separate from timing, so it can use a normal timeout.
   const visualDelay = Math.max(0, (playAt - now()) * 1000);
   setTimeout(function(){
     if(token === state.playbackToken && state.isPlaying){
@@ -1736,7 +1733,6 @@ function schedulerTick(){
   const endCycle = getCycleAt(horizon) + 1;
   pruneScheduledKeys(currentCycle);
 
-  // Use a snapshot so overdubs can safely be added while playback is running.
   const events = state.loopEvents.slice().sort(function(a,b){ return a.time - b.time; });
 
   for(let cycle=currentCycle; cycle<=endCycle; cycle++){
@@ -1750,7 +1746,6 @@ function schedulerTick(){
       const evTime = normalizeLoopTime(ev.time);
       const playAt = cycleStart + evTime;
 
-      // Do not schedule notes that are already behind the clock.
       if(playAt < t + 0.004) continue;
       if(playAt > horizon) continue;
 
@@ -1768,9 +1763,6 @@ function startPlaybackEngine(triggerNow){
   state.playbackToken++;
   state.scheduledKeys = new Set();
 
-  // triggerNow means start the loop from the top immediately.
-  // false means the first pass is being manually recorded and only the repeat
-  // should be scheduled.
   if(triggerNow){
     state.loopStartTime = now() + 0.045;
   }
@@ -1779,10 +1771,12 @@ function startPlaybackEngine(triggerNow){
   state.schedulerTimer = setInterval(schedulerTick, 18);
 }
 
-function restartPlaybackEnginePreservePosition(){
+function restartPlaybackEnginePreservePosition(oldLength){
   if(!state.isPlaying || state.loopLength <= 0) return;
-  const pos = currentLoopPosition(now());
-  state.loopStartTime = now() - pos;
+  const previousLength = oldLength || state.loopLength;
+  const oldPos = previousLength > 0 ? ((now() - state.loopStartTime) % previousLength + previousLength) % previousLength : 0;
+  const progress = previousLength > 0 ? (oldPos / previousLength) : 0;
+  state.loopStartTime = now() - (progress * state.loopLength);
   startPlaybackEngine(false);
   schedulerTick();
 }
@@ -2005,6 +1999,30 @@ function drawMeter(){
   state.meterRaf = requestAnimationFrame(drawMeter);
 }
 
+function refreshFixedLoopTiming(reason){
+  if(!state.fixedLoop) return;
+  const oldLength = state.loopLength > 0 ? state.loopLength : loopSeconds();
+  const newLength = loopSeconds();
+  state.loopLength = newLength;
+  updateLoopTicks();
+
+  if(state.waitingForFirstHit || (!state.isPlaying && !state.isRecording)){
+    return;
+  }
+
+  if(state.isPlaying){
+    restartPlaybackEnginePreservePosition(oldLength);
+    if(state.metronomeEnabled) startMetronome();
+    if(reason) setStatus(reason);
+    return;
+  }
+
+  if(state.isRecording && !state.isPlaying){
+    state.loopLength = newLength;
+    if(reason) setStatus(reason);
+  }
+}
+
 function setFixedMode(on){
   state.fixedLoop = on;
   $('fixedModeBtn').classList.toggle('on', on);
@@ -2051,26 +2069,13 @@ function redo(){
 function extendLoopBars(delta){
   const newBars = clamp(state.bars + delta, 1, 16);
   if(newBars === state.bars) return;
-  const oldLen = state.fixedLoop ? loopSeconds() : state.loopLength;
   state.bars = newBars;
   $('bars').value = String(state.bars);
   $('barsVal').textContent = String(state.bars);
-  updateLoopTicks();
-
   if(state.fixedLoop){
-    const newLen = loopSeconds();
-    if(state.isPlaying){
-      const currentPos = currentLoopPosition(now());
-      state.loopLength = newLen;
-      state.loopStartTime = now() - currentPos;
-      state.lastLoopPos = currentPos;
-      state.nextCycleStart = state.loopStartTime + (Math.floor((now() - state.loopStartTime) / state.loopLength) + 1) * state.loopLength;
-    } else {
-      state.loopLength = newLen;
-    }
-    setStatus(delta > 0 ? 'Loop extended by 1 bar.' : 'Loop shortened by 1 bar.');
-  } else if(oldLen > 0){
-    state.loopLength = oldLen;
+    refreshFixedLoopTiming(delta > 0 ? 'Loop extended by 1 bar.' : 'Loop shortened by 1 bar.');
+  } else {
+    updateLoopTicks();
   }
 }
 
@@ -2139,7 +2144,7 @@ async function toggleMic(){
       state.micSource = null;
       state.micGainNode = null;
       state.micRecordDest = null;
-      $('micEnableBtn').textContent = 'Mic Off';
+      $('micEnableBtn').textContent = 'Enable Mic';
       $('micEnableBtn').classList.remove('on');
       $('micStatus').textContent = 'Mic off.';
       return;
@@ -2166,7 +2171,7 @@ async function toggleMic(){
     state.micGainNode = gain;
     state.micRecordDest = dest;
 
-    $('micEnableBtn').textContent = 'Mic On';
+    $('micEnableBtn').textContent = 'Disable Mic';
     $('micEnableBtn').classList.add('on');
     $('micStatus').textContent = 'Mic ready. Choose a pad and tap Record Sample.';
   }catch(err){
@@ -2180,17 +2185,25 @@ function silentCountdown(cb){
   $('countdown').classList.add('show');
   function next(){
     n -= 1;
-    $('countdown').textContent = String(n);
     if(n <= 0){
+      $('countdown').textContent = '1';
       setTimeout(function(){
         $('countdown').classList.remove('show');
         cb();
       }, 300);
-    } else setTimeout(next, 650);
+    } else {
+      $('countdown').textContent = String(n);
+      setTimeout(next, 650);
+    }
   }
   setTimeout(next, 650);
 }
 function startSampleRecording(){
+  if(!window.MediaRecorder){
+    $('micStatus').textContent = 'This browser does not support in-app sample recording.';
+    setStatus('MediaRecorder is unavailable.');
+    return;
+  }
   if(!state.micStream){
     $('micStatus').textContent = 'Turn the mic on first.';
     setStatus('Mic is off.');
@@ -2225,14 +2238,23 @@ function stopSampleRecording(){
 }
 async function finalizeSampleRecording(){
   try{
+    state.sampleRecorder = null;
+    if(!state.sampleChunks.length){
+      $('micStatus').textContent = 'No audio was captured. Try again.';
+      setStatus('No sample was recorded.');
+      return;
+    }
     const blob = new Blob(state.sampleChunks, {type: state.sampleChunks[0] ? state.sampleChunks[0].type : 'audio/webm'});
+    if(!blob.size){
+      $('micStatus').textContent = 'The recording was empty. Try again.';
+      setStatus('No sample was recorded.');
+      return;
+    }
     const arrayBuffer = await blob.arrayBuffer();
     const decoded = await state.audio.ctx.decodeAudioData(arrayBuffer.slice(0));
     const out = state.audio.ctx.createBuffer(1, decoded.length, decoded.sampleRate);
     const src = decoded.getChannelData(0);
     const dst = out.getChannelData(0);
-    // Audio was already recorded through the mic gain node. Apply a gentle
-    // safety normalization so quiet phone recordings still play back clearly.
     let peak = 0.001;
     for(let i=0;i<src.length;i++) peak = Math.max(peak, Math.abs(src[i]));
     const norm = Math.min(2.5, 0.85 / peak);
@@ -2249,6 +2271,8 @@ async function finalizeSampleRecording(){
   } catch(err){
     $('micStatus').textContent = 'Could not decode this recording in the browser.';
     setStatus('Sample decoding failed.');
+  } finally {
+    state.sampleChunks = [];
   }
 }
 
@@ -2385,6 +2409,10 @@ function exportOffline(asMp3){
     if(t === 'snare' || t === 'snareLofi' || t === 'clap' || t === 'brush' || t === 'crack'){
       oNoise(t === 'brush' ? 2600 : (t === 'snareLofi' ? 950 : 1800), t === 'clap' ? .18 : .24, .7, settings, startAt);
       oOsc(t === 'clap' ? 'square' : 'triangle', t === 'brush' ? 210 : 180, .18, .22, settings, startAt);
+      if(t === 'clap'){
+        oNoise(2000, 0.08, 0.45, settings, startAt + 0.04);
+        oNoise(2200, 0.06, 0.35, settings, startAt + 0.08);
+      }
       return;
     }
     if(t === 'hat' || t === 'openhat' || t === 'shaker' || t === 'hat2' || t === 'metalHat'){
@@ -2579,15 +2607,21 @@ function bindEvents(){
   $('bpm').addEventListener('input', function(){
     state.bpm = Number(this.value);
     updateSettingsLabels();
-    if(state.fixedLoop && !state.isPlaying && !state.waitingForFirstHit) state.loopLength = loopSeconds();
-    updateLoopTicks();
+    if(state.fixedLoop){
+      refreshFixedLoopTiming('BPM updated.');
+    } else {
+      updateLoopTicks();
+    }
     if(state.isPlaying && state.metronomeEnabled) startMetronome();
   });
   $('bars').addEventListener('input', function(){
     state.bars = Number(this.value);
     updateSettingsLabels();
-    if(state.fixedLoop && !state.isPlaying && !state.waitingForFirstHit) state.loopLength = loopSeconds();
-    updateLoopTicks();
+    if(state.fixedLoop){
+      refreshFixedLoopTiming('Loop bars updated.');
+    } else {
+      updateLoopTicks();
+    }
   });
   $('metroVol').addEventListener('input', updateSettingsLabels);
   $('extendLoopBtn').addEventListener('click', function(){ extendLoopBars(1); });
@@ -2649,9 +2683,7 @@ function bindEvents(){
   });
   $('bankCollapseBtn').addEventListener('click', function(){
     state.bankCollapsed = !state.bankCollapsed;
-    $('deckLook').style.maxHeight = state.bankCollapsed ? '118px' : '';
-    $('deckLook').style.overflowY = state.bankCollapsed ? 'hidden' : 'auto';
-    $('deckLook').style.webkitOverflowScrolling = 'touch';
+    $('deckLook').classList.toggle('collapsed', state.bankCollapsed);
     this.textContent = state.bankCollapsed ? 'Open' : 'Deck';
     setStatus(state.bankCollapsed ? 'Banks collapsed into the deck.' : 'Banks expanded.');
   });
