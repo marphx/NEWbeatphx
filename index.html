@@ -1218,6 +1218,8 @@ const state = {
   scheduledKeys: new Set(),
   lastPruneCycle: -999,
   nextEventId: 1,
+  playbackToken: 0,
+  scheduleHorizon: 0.07,
   visualHits: [],
   metronomeEnabled: false,
   countInEnabled: true,
@@ -1588,8 +1590,12 @@ function addLoopEvent(padIndex, sound, settings, when){
   } else {
     pos = Math.max(0, Math.min(pos, 120));
   }
-  state.loopEvents.push({id:state.nextEventId++, time:pos, pad:padIndex, sound:sound, settings:settings, createdCycle:-1});
+  const createdCycle = (state.isPlaying && state.loopLength > 0) ? getCycleAt(when) : -1;
+  state.loopEvents.push({id:state.nextEventId++, time:pos, pad:padIndex, sound:sound, settings:settings, createdCycle:createdCycle});
   state.redoStack = [];
+  if(state.isPlaying && state.loopLength > 0){
+    schedulerTick();
+  }
 }
 
 function tapPad(padIndex, scheduledTime, skipRecord, forcedSound, forcedSettings){
@@ -1633,8 +1639,8 @@ function tapPad(padIndex, scheduledTime, skipRecord, forcedSound, forcedSettings
     addLoopEvent(padIndex, sound, settings, time);
     if(wasFirstFixedHit){
       startPlaybackEngine(false);
-    } else if(state.isPlaying && state.fixedLoop){
-      restartPlaybackEnginePreservePosition();
+    } else if(state.isPlaying && state.loopLength > 0){
+      schedulerTick();
     }
   }
 }
@@ -1688,49 +1694,97 @@ function getCycleAt(t){
   return Math.floor((t - state.loopStartTime) / state.loopLength);
 }
 
-function playFullCycle(){
+function normalizeLoopTime(value){
+  if(state.loopLength <= 0) return Math.max(0, value);
+  const wrapped = value % state.loopLength;
+  return wrapped < 0 ? wrapped + state.loopLength : wrapped;
+}
+
+function pruneScheduledKeys(currentCycle){
+  const keep = new Set();
+  state.scheduledKeys.forEach(function(key){
+    const cycle = Number(key.split(':')[0]);
+    if(cycle >= currentCycle - 1) keep.add(key);
+  });
+  state.scheduledKeys = keep;
+}
+
+function scheduleEventForAudio(ev, playAt, token){
+  if(token !== state.playbackToken || !state.isPlaying) return;
+
+  // Schedule sound directly on the Web Audio clock. This avoids the late
+  // setTimeout cycle glitch that caused loops to repeat randomly after stop.
+  playPadSound(ev.sound, ev.settings, ev.pad, playAt);
+
+  // Visual feedback is separate from timing, so it can use a normal timeout.
+  const visualDelay = Math.max(0, (playAt - now()) * 1000);
+  setTimeout(function(){
+    if(token === state.playbackToken && state.isPlaying){
+      flashPad(ev.pad);
+      pushVisual(ev.pad);
+    }
+  }, visualDelay);
+}
+
+function schedulerTick(){
   if(!state.isPlaying || state.loopLength <= 0) return;
-  const cycleStart = now() + 0.035;
-  state.loopStartTime = cycleStart;
+
+  const token = state.playbackToken;
+  const t = now();
+  const horizon = t + state.scheduleHorizon;
+  const currentCycle = getCycleAt(t);
+  const endCycle = getCycleAt(horizon) + 1;
+  pruneScheduledKeys(currentCycle);
+
+  // Use a snapshot so overdubs can safely be added while playback is running.
   const events = state.loopEvents.slice().sort(function(a,b){ return a.time - b.time; });
 
-  for(let i=0;i<events.length;i++){
-    const ev = events[i];
-    playPadSound(ev.sound, ev.settings, ev.pad, cycleStart + ev.time);
-    const visualDelay = Math.max(0, ev.time * 1000);
-    setTimeout(function(pad){
-      if(state.isPlaying){
-        flashPad(pad);
-        pushVisual(pad);
-      }
-    }, visualDelay, ev.pad);
+  for(let cycle=currentCycle; cycle<=endCycle; cycle++){
+    const cycleStart = state.loopStartTime + cycle * state.loopLength;
+
+    for(let i=0;i<events.length;i++){
+      const ev = events[i];
+      if(typeof ev.id === 'undefined') ev.id = i + 1;
+      if(typeof ev.createdCycle === 'number' && ev.createdCycle >= cycle) continue;
+
+      const evTime = normalizeLoopTime(ev.time);
+      const playAt = cycleStart + evTime;
+
+      // Do not schedule notes that are already behind the clock.
+      if(playAt < t + 0.004) continue;
+      if(playAt > horizon) continue;
+
+      const key = cycle + ':' + ev.id;
+      if(state.scheduledKeys.has(key)) continue;
+      state.scheduledKeys.add(key);
+
+      scheduleEventForAudio(ev, playAt, token);
+    }
   }
 }
 
 function startPlaybackEngine(triggerNow){
   stopPlaybackEngine();
+  state.playbackToken++;
+  state.scheduledKeys = new Set();
+
+  // triggerNow means start the loop from the top immediately.
+  // false means the first pass is being manually recorded and only the repeat
+  // should be scheduled.
   if(triggerNow){
-    playFullCycle();
-  }else{
-    // Do not replay the first hit immediately while recording the first pass.
-    state.loopStartTime = state.loopStartTime || now();
+    state.loopStartTime = now() + 0.045;
   }
-  state.schedulerTimer = setInterval(function(){
-    playFullCycle();
-  }, Math.max(80, state.loopLength * 1000));
+
+  schedulerTick();
+  state.schedulerTimer = setInterval(schedulerTick, 18);
 }
 
 function restartPlaybackEnginePreservePosition(){
   if(!state.isPlaying || state.loopLength <= 0) return;
-  stopPlaybackEngine();
-  const elapsed = currentLoopPosition(now());
-  const remaining = Math.max(40, (state.loopLength - elapsed) * 1000);
-  state.schedulerTimer = setTimeout(function(){
-    if(state.isPlaying){
-      playFullCycle();
-      state.schedulerTimer = setInterval(playFullCycle, Math.max(80, state.loopLength * 1000));
-    }
-  }, remaining);
+  const pos = currentLoopPosition(now());
+  state.loopStartTime = now() - pos;
+  startPlaybackEngine(false);
+  schedulerTick();
 }
 
 function stopPlaybackEngine(){
@@ -1742,6 +1796,7 @@ function stopPlaybackEngine(){
   clearTimeout(state.schedulerTimer);
   state.schedulerTimer = null;
   state.scheduledKeys = new Set();
+  state.playbackToken++;
 }
 
 function startScheduler(){
@@ -1804,7 +1859,7 @@ function toggleRecord(){
   if(state.isPlaying){
     state.isRecording = !state.isRecording;
     $('recBtn').classList.toggle('active', state.isRecording);
-    setStatus(state.isRecording ? 'Overdub on. Add more hits.' : 'Overdub off. Loop keeps playing.');
+    setStatus(state.isRecording ? 'Overdub on. New hits will join the next repeat.' : 'Overdub off. Loop keeps playing.');
   }
 }
 function togglePlay(){
@@ -1827,7 +1882,7 @@ function togglePlay(){
     state.nextCycleNumber = 0;
     for(let i=0;i<state.loopEvents.length;i++){
       if(typeof state.loopEvents[i].id === 'undefined') state.loopEvents[i].id = state.nextEventId++;
-      if(typeof state.loopEvents[i].createdCycle === 'undefined') state.loopEvents[i].createdCycle = -1;
+      state.loopEvents[i].createdCycle = -1;
     }
     $('playBtn').classList.add('active');
     $('recBtn').classList.remove('active');
